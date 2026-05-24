@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import base64
+import io
 import json
 import mimetypes
 import os
@@ -30,13 +31,10 @@ import datetime
 import asyncio
 import ssl
 import tempfile
-from cryptography import x509
-from cryptography.x509.oid import NameOID
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 import datetime
 import aiohttp
 from aiohttp import web
+from PIL import Image
 
 # -------------------- CONFIG --------------------
 SERVICE_UUID = "00003331-0000-1000-8000-008123456789"
@@ -44,30 +42,85 @@ CHAR_STATUS_UUID = "00009954-0000-1000-8000-00805f9b34fb"
 CHAR_P2P_UUID = "00009953-0000-1000-8000-00805f9b34fb"
 SERVER_PORT = 55665
 # ------------------------------------------------
-
-
-
-if len(sys.argv) < 3:
-    print("usage:sudo python sender.py <wifi interface> <file>")
+if len(sys.argv) < 2:
+    print("usage:sudo python sender.py <file>")
     sys.exit(1)
 
-INTERFACE = sys.argv[1]
-FILE_PATH = sys.argv[2]
-MIME_TYPE = (
-    mimetypes.guess_type(FILE_PATH)[0]
-    or "application/octet-stream"
+def get_wifi_interface():
+    out = subprocess.check_output("iw dev", shell=True, text=True)
+
+    # 找第一个 interface
+    m = re.search(r"Interface\s+(\w+)", out)
+    if not m:
+        raise RuntimeError("No wifi interface found")
+
+    return m.group(1)
+
+INTERFACE = get_wifi_interface()
+FILES = sys.argv[1:]
+
+if not FILES:
+    print("usage: sender.py <files...>")
+    sys.exit(1)
+
+for f in FILES:
+    if not os.path.isfile(f):
+        print("file not found:", f)
+        sys.exit(1)
+
+print(f"[INFO] Use {INTERFACE} to send {FILES}")
+
+FILE_COUNT = len(FILES)
+FILE_SIZE_ALL = sum(os.path.getsize(f) for f in FILES)
+
+# 单文件
+if FILE_COUNT == 1:
+    FILE_PATH = FILES[0]
+    FILE_NAME = os.path.basename(FILE_PATH)
+    MIME_TYPE = (
+        mimetypes.guess_type(FILE_PATH)[0]
+        or "application/octet-stream"
+    )
+
+# 多文件自动 zip
+else:
+    FILE_NAME = "files.zip"
+    MIME_TYPE = "application/zip"
+
+
+# THUMBNAIL
+def build_thumbnail(file_path):
+    try:
+        img = Image.open(file_path)
+
+        img.thumbnail((320, 320))
+
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+
+        out = io.BytesIO()
+
+        img.save(out, format="PNG")
+
+        return out.getvalue()
+
+    except Exception as e:
+        print(e)
+        return None
+
+
+THUMBNAIL_DATA = (
+    build_thumbnail(FILES[0])
+    if FILE_COUNT == 1
+    else None
 )
-if not os.path.isfile(FILE_PATH):
-    print("file not found:", FILE_PATH)
-    sys.exit(1)
-
-print(f"[INFO] Use {INTERFACE} to send {FILE_PATH}")
 
 
-def zip_file(file_path):
+# ZIP
+def zip_file(files):
     zip_path = os.path.join(
         tempfile.gettempdir(),
-        os.path.basename(file_path) + ".zip"
+        os.path.basename(files[0]) + ".zip"
     )
 
     with zipfile.ZipFile(
@@ -75,17 +128,32 @@ def zip_file(file_path):
         "w",
         zipfile.ZIP_DEFLATED
     ) as z:
-        z.write(file_path, arcname=os.path.basename(file_path))
+        for f in files:
+            z.write(
+                f,
+                arcname=os.path.basename(f)
+            )
 
     return zip_path
 
+
+# DOWNLOAD
 async def download_file(request):
     task_id = request.query.get("taskId")
-
     print("download task:", task_id)
+    return web.FileResponse(zip_file(FILES))
 
-    return web.FileResponse(zip_file(FILE_PATH))
+async def thumbnail(request):
+    task_id = request.query.get("taskId")
 
+    print("thumbnail task:", task_id)
+    return web.Response(
+        body=THUMBNAIL_DATA,
+        content_type="image/png",
+        headers={
+            "Content-Length": str(len(THUMBNAIL_DATA))
+        }
+    )
 
 async def run_websocket_server(domains=None, key_password=b"foobar", cert_password="foobar", host="0.0.0.0"):
     if domains is None:
@@ -116,8 +184,6 @@ async def run_websocket_server(domains=None, key_password=b"foobar", cert_passwo
 
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_context.load_cert_chain(cert_path, key_path, password=cert_password)
-        file_name = os.path.basename(FILE_PATH)
-        file_size = os.path.getsize(FILE_PATH)
         async def websocket_handler(request):
             ws = web.WebSocketResponse()
             await ws.prepare(request)
@@ -128,18 +194,35 @@ async def run_websocket_server(domains=None, key_password=b"foobar", cert_passwo
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         print(f"[服务器] 收到消息 (来自 {request.remote}): {msg.data}")
                         if "versionNego" in msg.data:
-                            await ws.send_str(
-                            f'action:1:sendRequest?{{'
-                            f'"taskId":"123456",'
-                            f'"id":"123456",'
-                            f'"senderId":"AABB",'
-                            f'"senderName":"Linux",'
-                            f'"fileName":"{file_name}",'
-                            f'"mimeType":"{MIME_TYPE}",'
-                            f'"fileCount":1,'
-                            f'"totalSize":{file_size}'
-                            f'}}'
-                            )
+                            if THUMBNAIL_DATA is None:
+                                await ws.send_str(
+                                f'action:1:sendRequest?{{'
+                                f'"taskId":"123456",'
+                                f'"id":"123456",'
+                                f'"senderId":"AABB",'
+                                f'"senderName":"Linux",'
+                                f'"fileName":"{FILE_NAME}",'
+                                f'"mimeType":"{MIME_TYPE}",'
+                                f'"fileCount":{FILE_COUNT},'
+                                f'"totalSize":{FILE_SIZE_ALL}'
+                                f'}}'
+                                ) 
+                            else:
+                                await ws.send_str(
+                                f'action:1:sendRequest?{{'
+                                f'"taskId":"123456",'
+                                f'"id":"123456",'
+                                f'"senderId":"AABB",'
+                                f'"senderName":"Linux",'
+                                f'"fileName":"{FILE_NAME}",'
+                                f'"mimeType":"{MIME_TYPE}",'
+                                f'"fileCount":{FILE_COUNT},'
+                                f'"totalSize":{FILE_SIZE_ALL},'
+                                f'"thumbnail":"/thumbnail?taskId=123456",'
+                                f'"thumbnail_height":320,'
+                                f'"thumbnail_width":320'
+                                f'}}'
+                                )
                         elif "\"type\":1" in msg.data:
                             print("User Accept Task")
                         elif "\"type\":3" in msg.data:
@@ -157,6 +240,7 @@ async def run_websocket_server(domains=None, key_password=b"foobar", cert_passwo
         app = web.Application()
         app.router.add_get("/websocket", websocket_handler)
         app.router.add_get("/download", download_file)
+        app.router.add_get("/thumbnail", thumbnail)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, host=host, port=SERVER_PORT, ssl_context=ssl_context)
@@ -201,8 +285,8 @@ def parse_service_data(record):
 
 # ----------- BLE SCAN --------------------------
 async def scan_devices():
-    print("[SCAN] Scanning BLE devices for 5 seconds...")
-    devices = await BleakScanner.discover(timeout=5.0)
+    print("[SCAN] Scanning BLE devices for 10 seconds...")
+    devices = await BleakScanner.discover(timeout=10.0)
     matching_devices = []
 
     for device in devices:
@@ -287,7 +371,7 @@ def sh(cmd):
         capture_output=True
     ).stdout.strip()
 
-def start_dhcp_server(interface="wlp4s0"):
+def start_dhcp_server(interface):
 
     def run():
 
@@ -323,34 +407,43 @@ lease_file /tmp/udhcpd.leases
     
 def create_p2p(interface=INTERFACE, conf="p2p.conf"):
     sh("sudo killall wpa_supplicant dnsmasq")
-    sh("sudo systemctl stop NetworkManager ")
-    sh("sudo systemctl stop systemd-resolved")
-    sh("sudo systemctl rm -rf /var/run/wpa_supplicant/*")
+    sh("sudo systemctl stop NetworkManager systemd-resolved")
+    sh("sudo rm -rf /var/run/wpa_supplicant/*")
 
-
+    # 后台启动
     subprocess.Popen(
-        f"sudo wpa_supplicant -i {interface} -c {conf}",
+        f"sudo wpa_supplicant "
+        f"-i {interface} "
+        f"-c {conf}",
         shell=True
     )
 
-    time.sleep(2)
+    # 等待接口 ready
+    while "PONG" not in sh(f"sudo wpa_cli -i {interface} ping"):
+        time.sleep(0.1)
 
+    # 建组
     sh(f"sudo wpa_cli -i {interface} p2p_group_add")
 
-    time.sleep(2)
+    # 等待 GO 启动完成
+    while "freq=" not in sh(f"sudo wpa_cli -i {interface} status"):
+        time.sleep(0.1)
 
+    # 配 IP
     sh(f"sudo ip addr flush dev {interface}")
     sh(f"sudo ip addr add 192.168.49.1/24 dev {interface}")
     sh(f"sudo ip link set {interface} up")
-    
-    time.sleep(1)
+
+    # DHCP
     start_dhcp_server(interface)
 
+    info = sh(f"sudo wpa_cli -i {interface} status")
+
     return (
-        sh(f"sudo wpa_cli -i {interface} status | grep ^ssid= | cut -d= -f2"),
+        sh(f"echo '{info}' | grep ^ssid= | cut -d= -f2"),
         sh(f"sudo wpa_cli -i {interface} p2p_get_passphrase"),
-        sh(f"sudo wpa_cli -i {interface} status | grep ^p2p_device_address= | cut -d= -f2"),
-        sh(f"sudo wpa_cli -i {interface} status | grep ^freq= | cut -d= -f2"),
+        sh(f"echo '{info}' | grep ^p2p_device_address= | cut -d= -f2"),
+        sh(f"echo '{info}' | grep ^freq= | cut -d= -f2"),
     )
 
 
@@ -365,7 +458,7 @@ atexit.register(restore_network)
 # ----------- BLE READ/WRITE -------------------
 async def read_write_ble(device):
     ssid, psk, mac,freq = create_p2p()
-    time.sleep(1)  # 确保 P2P Group 已稳定创建
+    time.sleep(1)
     asyncio.create_task(run_websocket_server(host="0.0.0.0"))
     try:
         async with BleakClient(device.address) as client:
@@ -388,7 +481,6 @@ async def read_write_ble(device):
                 print(f"[WARN] Failed to read status char: {e}")
                 info = {}
 
-            time.sleep(1)  # 等待 P2P Group 稳定
            
             # 派生 session key
             cipher = None

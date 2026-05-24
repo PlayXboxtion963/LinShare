@@ -4,12 +4,14 @@
 
 ## 功能
 
-- 设备发现  ✅️
-- 文件接收  ✅️
-- 文件发送  ✅️
-- 缩略图    
-- 批量发送
-- GUI
+
+- 设备发现       ✅️
+- 文件接收       ✅️
+- 文件发送       ✅️
+- 图片缩略图     ✅️
+- 批量文件发送   ✅️
+
+
 
 ## 系统要求
 
@@ -29,8 +31,12 @@ sudo apt install udhcpd
 
 #### Python 依赖
 ```bash
-dbus-python
-websockets
+dbus-python 
+websockets 
+bleak 
+cryptography 
+aiohttp 
+pillow
 ```
 
 ## 启动
@@ -40,12 +46,12 @@ python3 receiver.py
 ```
 ### 发送
 ```bash
-sudo python3 wlan0 demo.jpg
+sudo python3 sender.py demo.jpg
 ```
 
 ## 演示
-<img src="demo.jpg" alt="描述" width="300">
-
+### 接收文件
+<img src="demo.jpg" alt="接收" width="300">
 
 ## 参考项目
 
